@@ -2,8 +2,8 @@
  * Operating Systems  (2INC0)   Practical Assignment
  * Threaded Application
  *
- * STUDENT_NAME_1 (STUDENT_NR_1)
- * STUDENT_NAME_2 (STUDENT_NR_2)
+ * Roel Hospel (0809845)
+ * Mark Hendriks (0816059)
  *
  * Grading:
  * Students who hand in clean code that fully satisfies the minimum requirements will get an 8. 
@@ -22,31 +22,82 @@
 
 #include "prime.h"
 
+static const int BLOCK_COUNT = ((NROF_SIEVE / 64) + 1);
+
+static const unsigned long long ONE = 1;
+
 typedef struct {
     int base;
     sem_t* sem;
 } Data;
 
-typedef enum {false, true} bool;
+typedef struct {
+    pthread_t threads[NROF_THREADS];
+    pthread_mutex_t* lock;
+    int index;
+} List;
 
 static void rsleep (int t);
 
+List* list;
+
+static List* getList()
+{
+    static char init = 0;
+    if (!init)
+    {
+        list = malloc(sizeof(List));
+        list->lock = malloc(sizeof(pthread_mutex_t));
+        list->index = 0;
+        int errno;
+        if ((errno = pthread_mutex_init(list->lock, NULL)) < 0)
+        {
+            printf("An error occurred whilst creating a mutex lock: %d\n", errno);
+            exit(-1);
+        }
+        init = 1;
+    }
+    return list;
+}
+
+static void register_dead_thread(pthread_t value)
+{
+    List* list = getList();
+    pthread_mutex_lock(list->lock);
+    list->threads[list->index++] = value;
+    pthread_mutex_unlock(list->lock);
+}
+
+static void flush_dead_threads()
+{
+    List* list = getList();
+    pthread_mutex_lock(list->lock);
+    int i;
+    for (i = 0; i < list->index; i++)
+    {
+        pthread_join(list->threads[i], NULL);
+    }
+    list->index = 0;
+    pthread_mutex_unlock(list->lock);
+}
+
+pthread_mutex_t* locks[(NROF_SIEVE / 64) + 1];
+
 static pthread_mutex_t* getLock(int blockNr)
 {
-    static pthread_mutex_t locks[(NROF_SIEVE / 64) + 1];
-    static bool initialized = false;
-    // RIP in boolean
-    if (initialized == false)
+    static char initialized = 0;
+    if (!initialized)
     {
         int  i;
-        for (i = 0; i < locks / sizeof(pthread_mutex_t); i++)
+        for (i = 0; i < BLOCK_COUNT; i++)
         {
-            locks[i] = PTHREAD_MUTEX_INITIALIZER;
+            locks[i] = malloc(sizeof(pthread_mutex_t));
+            pthread_mutex_init(locks[i], NULL);
         }
-        initialized = true;
+        initialized = 1;
     }
     // Return the address to lock for block blockNr
-    return &locks[blockNr];
+    return locks[blockNr];
 }
 
 // Obtain the lock for a specific block
@@ -65,7 +116,7 @@ static void unlock(int blockNr)
 // oldValue ^= val. The locks ensure only one thread accesses a specific block at a time.
 //
 // Returns whether the value of the block changed
-static int scrap(int blockNr, int val)
+static int scrap(int blockNr, unsigned long long val)
 {
     lock(blockNr);
     unsigned long long old = buffer[blockNr];
@@ -76,29 +127,36 @@ static int scrap(int blockNr, int val)
 }
 
 // Entry point for threads. Scraps all the numbers which are a multiple of the base.
-static void run_sieve(void* args)
+static void* run_sieve(void* args)
 {
     Data* data = args;
-    int val = 0;
-    int blockNr = 0;
+    unsigned long long val = 0;
     int base = data->base;
-    for (n = base * 2; n < MAX_SIEVE; n = n + base)
+    int blockNr = base / 64;
+    int n;
+    for (n = base * 2; n <= NROF_SIEVE; n = n + base)
     {
         // n is twice the base, so it cannot be 0 (as base is guaranteed to be >= 1)
-        if (n % 64 == 0)
+        if (n / 64 != blockNr)
         {
-            // If scrap did not change anything, it's very unlikely it will find results further on
-            if (scrap(val, blockNr))
-            {
-                break;
-            }
+            scrap(blockNr, val);
+            // Reset val
             val = 0;
-            blockNr = blockNr + 1;
+            // Update blockNr
+            blockNr = n / 64;
+            rsleep(100);
         }
-        int bitpos = n - (blockNr * 64);
-        val = val | (1 << bitpos);
+        // The value of 2 is at the 2nd bit
+        // Which means we only need to bitshift 1 to the left
+        // Hence the '- 1' at the end.
+        unsigned long long bitpos = n - (blockNr * 64) - 1;
+        val = val | (ONE << bitpos);
     }
+    scrap(blockNr, val);
+    register_dead_thread(pthread_self());
     sem_post(data->sem);
+    free(data);
+    return (NULL);
 }
 
 int main (void)
@@ -106,44 +164,66 @@ int main (void)
     // TODO: start threads generate all primes between 2 and NROF_SIEVE and output the results
     // (see thread_malloc_free_test() and thread_mutex_test() how to use threads and mutexes,
     //  see bit_test() how to manipulate bits in a large integer)
+    // Initialize buffer
+    int i;
+    for (i = 0; i < BLOCK_COUNT; i++)
+    {
+        buffer[i] = -1;
+    }
 
     // Initialize block locks and semaphore
     getLock(0);
+    // Initialize List
+    getList();
     sem_t sem;
-    sem_init(&sem, 0, NROF_THREAD);
+    sem_init(&sem, 0, NROF_THREADS);
 
     // For each number within 1 and MAX_SIEVE
-    for (i = 2; i <= MAX_SIEVE; i++)
+    for (i = 2; i <= NROF_SIEVE; i++)
     {
         // Wait for the semaphore to ensure we don't use more than NROF_THREAD
         sem_wait(&sem);
-        Data data;
-        data.base = i;
-        data.sem = &sem;
+        flush_dead_threads();
+        Data* data = malloc(sizeof(Data));
+        data->base = i;
+        data->sem = &sem;
         pthread_t thread;
         // Start the thread with the given data
-        pthread_create(&thread, NULL, &run_sieve, &data);
+        int errno;
+        if ((errno = pthread_create(&thread, NULL, run_sieve, data)) < 0)
+        {
+            printf("ERROR: %d", errno);
+            exit(1);
+        }
+        rsleep(100);
     }
 
     // Wait until all semaphore locks are for the main thread
     // As we don't want to store NROF_THREAD pthread_t structs,
     // I went with this (cheaper) version
-    int n = NROF_THREAD;
+    int n = NROF_THREADS;
     while (n--)
     {
         sem_wait(&sem);
     }
     sem_destroy(&sem);
-
     // Print the result sequentially
-    for (i = 1; i <= MAX_SIEVE; i++)
+    for (i = 2; i <= NROF_SIEVE; i++)
     {
         int blockNr = i / 64;
-        int bitpos = i - (blockNr * 64);
-        int isPrimary = buffer[blockNr] & (1 >> bitpos) != 0;
+        // The value of 2 is at the 2nd bit
+        // Which means we only need to bitshift 1 to the left
+        // Hence the '- 1' at the end.
+        int bitpos = i - (blockNr * 64) - 1;
+        // Check if the bit is set
+        int isPrimary = (buffer[blockNr] & (ONE << bitpos)) != 0;
         if (isPrimary)
         {
-            printf("%d\n", i);
+            printf("%d", i);
+            if (i < NROF_SIEVE) 
+            {
+                printf("\n");
+            }
         }
     }
     return (0);
