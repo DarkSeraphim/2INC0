@@ -8,6 +8,7 @@ BINARIES = prime
 
 CC = gcc
 CFLAGS = -Wall -g -c
+DEPS = prime.h
 LDLIBS = -lpthread
 
 all:	$(BINARIES)
@@ -17,4 +18,4 @@ clean:
 
 prime: prime.o 
 
-prime.o: prime.c prime.h
+prime.o: prime.c
